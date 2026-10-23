@@ -207,7 +207,7 @@ typedef struct dictData {
     const char    *origFilename;
     const char    *comment;
     unsigned long crc;
-    unsigned long length;
+    unsigned long long length;
     unsigned long compressedLength;
     dictCache     cache[DICT_CACHE_SIZE];
 } dictData;

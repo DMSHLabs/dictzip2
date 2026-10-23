@@ -25,6 +25,9 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 
+#define V2_OUT_BUFFER_SIZE 524288
+#define V2_IN_BUFFER_SIZE 262144
+
 #include "getopt.h"
 
 static void xfwrite(
@@ -126,9 +129,15 @@ void dict_data_print_header(FILE *str, dictData *header) {
 }
 
 int dict_data_zip(const char *inFilename, const char *outFilename,
-                  const char *preFilter, const char *postFilter) {
+                  const char *preFilter, const char *postFilter,
+                  int formatVersion) {
     char          inBuffer[IN_BUFFER_SIZE];
+    char          v2InBuffer[V2_IN_BUFFER_SIZE];
+    char          *activeInBuffer;
     char          outBuffer[OUT_BUFFER_SIZE];
+    char          v2OutBuffer[V2_OUT_BUFFER_SIZE];
+    char          *activeOutBuffer;
+    int           activeOutBufferSize;
     int           count;
     unsigned long inputCRC = crc32( 0L, Z_NULL, 0 );
     z_stream      zStream;
@@ -138,13 +147,13 @@ int dict_data_zip(const char *inFilename, const char *outFilename,
     struct __stat64   st;
     char          *header;
     int           headerLength;
-    int           dataLength;
     int           extraLength;
+    int           subfieldLength;
     int           chunkLength;
 #if HEADER_CRC
     int           headerCRC;
 #endif
-    unsigned long chunks;
+    unsigned long long chunks;
     unsigned long chunk = 0;
     unsigned long total = 0;
     int           i;
@@ -186,31 +195,63 @@ int dict_data_zip(const char *inFilename, const char *outFilename,
     /* Write initial header information */
     chunkLength = (preFilter ? PREFILTER_IN_BUFFER_SIZE : IN_BUFFER_SIZE);
     _fstat64(fileno(inStr), &st);
+    if (formatVersion == 1) {
+        activeInBuffer = inBuffer;
+        activeOutBuffer = outBuffer;
+        activeOutBufferSize = OUT_BUFFER_SIZE;
+        chunks = st.st_size / chunkLength;
+        if (st.st_size % chunkLength) ++chunks;
+        extraLength = 10 + (int)(chunks * 2);
+        if (extraLength > 0xFFFF) {
+            fprintf(stderr, "\nFile too long for dictzip v1: %llu chunks needed; use --format v2\n", chunks);
+            fclose(inStr); fclose(outStr); _unlink(outFilename); return -1;
+        }
+        subfieldLength = extraLength - 4;
+    } else {
+    activeInBuffer = v2InBuffer;
+    activeOutBuffer = v2OutBuffer;
+    activeOutBufferSize = V2_OUT_BUFFER_SIZE;
     chunks = st.st_size / chunkLength;
     if (st.st_size % chunkLength) ++chunks;
     PRINTF(DBG_VERBOSE, ("%lu chunks * %u per chunk = %lu (filesize = %lu)\n",
             chunks, chunkLength, chunks * chunkLength,
             (unsigned long) st.st_size));
 
-    dataLength = chunks * 2;
-
-    extraLength = 10 + dataLength;
-    if (extraLength > 0xFFFF) {
-        fprintf(stderr, "\nFile too long: %u chunks needed, 32762 allowed\n", chunks);
-        fclose(inStr);
-        fclose(outStr);
-        _unlink(outFilename);
-        return -1;
+    /* V2's own preamble carries the full random-access index. Block size is
+       identical to v1; the preamble is not constrained by gzip XLEN. */
+    subfieldLength = (int)(26 + chunks * 4);
+    extraLength = subfieldLength + 10; /* custom preamble plus gzip header */
     }
 
-    headerLength = GZ_FEXTRA_START
-                   + extraLength        /* FEXTRA */
-                   + strlen(origFilename) + 1    /* FNAME  */
-                   + (HEADER_CRC ? 2 : 0);    /* FHCRC  */
-    PRINTF(DBG_VERBOSE, ("(data = %d, extra = %d, header = %d)\n",
-            dataLength, extraLength, headerLength));
+    if (formatVersion == 2)
+        headerLength = extraLength;
+    else
+        headerLength = GZ_FEXTRA_START
+                       + extraLength        /* FEXTRA */
+                       + strlen(origFilename) + 1    /* FNAME  */
+                       + (HEADER_CRC ? 2 : 0);    /* FHCRC  */
+    PRINTF(DBG_VERBOSE, ("(extra = %d, header = %d)\n",
+            extraLength, headerLength));
     header = malloc(headerLength);
     for (i = 0; i < headerLength; i++) header[i] = 0;
+    if (formatVersion == 2) {
+        memcpy(header, "DZV2", 4);
+        header[4] = 2; header[5] = 0;
+        header[6] = chunkLength & 0xff;
+        header[7] = (chunkLength >> 8) & 0xff;
+        header[8] = (chunkLength >> 16) & 0xff;
+        header[9] = (chunkLength >> 24) & 0xff;
+        for (i = 0; i < 8; ++i) {
+            header[10 + i] = (chunks >> (i * 8)) & 0xff;
+            header[18 + i] = ((unsigned long long)st.st_size >> (i * 8)) & 0xff;
+        }
+        header[subfieldLength + 0] = GZ_MAGIC1;
+        header[subfieldLength + 1] = GZ_MAGIC2;
+        header[subfieldLength + 2] = Z_DEFLATED;
+        header[subfieldLength + 3] = 0;
+        header[subfieldLength + 8] = GZ_MAX;
+        header[subfieldLength + 9] = GZ_OS_UNIX;
+    } else {
     header[GZ_ID1]        = GZ_MAGIC1;
     header[GZ_ID2]        = GZ_MAGIC2;
     header[GZ_CM]         = Z_DEFLATED;
@@ -227,35 +268,45 @@ int dict_data_zip(const char *inFilename, const char *outFilename,
     header[GZ_XLEN+1]     = (extraLength & 0xff00) >> 8;
     header[GZ_XLEN+0]     = (extraLength & 0x00ff) >> 0;
     header[GZ_SI1]        = GZ_RND_S1;
-    header[GZ_SI2]        = GZ_RND_S2;
-    header[GZ_SUBLEN+1]   = ((extraLength - 4) & 0xff00) >> 8;
-    header[GZ_SUBLEN+0]   = ((extraLength - 4) & 0x00ff) >> 0;
+    header[GZ_SI2]        = formatVersion == 2 ? 'Z' : GZ_RND_S2;
+    header[GZ_SUBLEN+1]   = (subfieldLength & 0xff00) >> 8;
+    header[GZ_SUBLEN+0]   = (subfieldLength & 0x00ff) >> 0;
     header[GZ_VERSION+1]  = 0;
-    header[GZ_VERSION+0]  = 1;
+    header[GZ_VERSION+0]  = formatVersion;
     header[GZ_CHUNKLEN+1] = (chunkLength & 0xff00) >> 8;
     header[GZ_CHUNKLEN+0] = (chunkLength & 0x00ff) >> 0;
-    header[GZ_CHUNKCNT+1] = (chunks & 0xff00) >> 8;
-    header[GZ_CHUNKCNT+0] = (chunks & 0x00ff) >> 0;
+        header[GZ_CHUNKCNT+1] = (chunks & 0xff00) >> 8;
+        header[GZ_CHUNKCNT+0] = (chunks & 0x00ff) >> 0;
     strcpy( &header[GZ_FEXTRA_START + extraLength], origFilename );
+    }
     xfwrite( header, 1, headerLength, outStr );
 
 
     /* Read, compress, write */
     while (!feof(inStr)) {
-        if ((count = fread(inBuffer, 1, chunkLength, inStr))) {
-            inputCRC = crc32(inputCRC, (const Bytef *) inBuffer, count);
-            zStream.next_in   = (Bytef *) inBuffer;
+        if ((count = fread(activeInBuffer, 1, chunkLength, inStr))) {
+            inputCRC = crc32(inputCRC, (const Bytef *) activeInBuffer, count);
+            zStream.next_in   = (Bytef *) activeInBuffer;
             zStream.avail_in  = count;
-            zStream.next_out  = (Bytef *) outBuffer;
-            zStream.avail_out = OUT_BUFFER_SIZE;
+            zStream.next_out  = (Bytef *) activeOutBuffer;
+            zStream.avail_out = activeOutBufferSize;
             if (deflate(&zStream, Z_FULL_FLUSH) != Z_OK)
                 err_fatal(__func__, "deflate: %s\n", zStream.msg);
             assert(zStream.avail_in == 0);
-            len = OUT_BUFFER_SIZE - zStream.avail_out;
-            assert(len <= 0xffff);
-            header[GZ_RNDDATA + chunk * 2 + 1] = (len & 0xff00) >> 8;
-            header[GZ_RNDDATA + chunk * 2 + 0] = (len & 0x00ff) >> 0;
-            xfwrite(outBuffer, 1, len, outStr);
+            len = activeOutBufferSize - zStream.avail_out;
+            if (formatVersion == 1) assert(len <= 0xffff);
+            if (formatVersion == 2) {
+                int pos = 26 + chunk * 4;
+                header[pos + 0] = len & 0xff;
+                header[pos + 1] = (len >> 8) & 0xff;
+                header[pos + 2] = (len >> 16) & 0xff;
+                header[pos + 3] = (len >> 24) & 0xff;
+            } else {
+                int pos = GZ_RNDDATA + chunk * 2;
+                header[pos + 0] = len & 0xff;
+                header[pos + 1] = (len >> 8) & 0xff;
+            }
+            xfwrite(activeOutBuffer, 1, len, outStr);
 
             ++chunk;
             total += count;
@@ -269,15 +320,15 @@ int dict_data_zip(const char *inFilename, const char *outFilename,
     PRINTF(DBG_VERBOSE, ("total: %lu chunks, %lu bytes\n", chunks, (unsigned long) st.st_size));
 
     /* Write last bit */
-    zStream.next_in = (Bytef *) inBuffer;
+    zStream.next_in = (Bytef *) activeInBuffer;
     zStream.avail_in = 0;
-    zStream.next_out = (Bytef *) outBuffer;
-    zStream.avail_out = OUT_BUFFER_SIZE;
+    zStream.next_out = (Bytef *) activeOutBuffer;
+    zStream.avail_out = activeOutBufferSize;
     if (deflate(&zStream, Z_FINISH) != Z_STREAM_END)
         err_fatal(__func__, "deflate: %s\n", zStream.msg);
     assert(zStream.avail_in == 0);
-    len = OUT_BUFFER_SIZE - zStream.avail_out;
-    xfwrite(outBuffer, 1, len, outStr);
+    len = activeOutBufferSize - zStream.avail_out;
+    xfwrite(activeOutBuffer, 1, len, outStr);
     PRINTF(DBG_VERBOSE, ("(wrote %d bytes, final, crc = %lx)\n",
             len, inputCRC));
 
@@ -286,10 +337,11 @@ int dict_data_zip(const char *inFilename, const char *outFilename,
     tail[0 + 2] = (inputCRC & 0x00ff0000) >> 16;
     tail[0 + 1] = (inputCRC & 0x0000ff00) >> 8;
     tail[0 + 0] = (inputCRC & 0x000000ff) >> 0;
-    tail[4 + 3] = (st.st_size & 0xff000000) >> 24;
-    tail[4 + 2] = (st.st_size & 0x00ff0000) >> 16;
-    tail[4 + 1] = (st.st_size & 0x0000ff00) >> 8;
-    tail[4 + 0] = (st.st_size & 0x000000ff) >> 0;
+    /* V2 keeps a standard gzip trailer after its private preamble. */
+    tail[4 + 3] = ((unsigned long long)st.st_size & 0xff000000) >> 24;
+    tail[4 + 2] = ((unsigned long long)st.st_size & 0x00ff0000) >> 16;
+    tail[4 + 1] = ((unsigned long long)st.st_size & 0x0000ff00) >> 8;
+    tail[4 + 0] = ((unsigned long long)st.st_size & 0x000000ff) >> 0;
     xfwrite(tail, 1, 8, outStr);
 
     /* Write final header information */
@@ -373,6 +425,7 @@ static void help(void) {
             "-L --license         display software license",
             "-c --stdout          write to stdout (decompression only)",
             "-t --test            test compressed file integrity",
+            "--format v1|v2      select compression format (default: v1)",
 //      "-v --verbose         verbose mode",
             "-V --version         display version number",
             0};
@@ -393,6 +446,7 @@ int main(int argc, char **argv) {
     int stdoutFlag = 0;
     int testFlag = 0;
     int verboseFlag = 0;
+    int formatVersion = 1;
     char buffer[BUFFERSIZE];
     char *buf;
     char *pre = NULL;
@@ -417,6 +471,7 @@ int main(int argc, char **argv) {
             {"test",       0, 0, 't'},
             {"verbose",    0, 0, 'v'},
             {"version",    0, 0, 'V'},
+            {"format",     1, 0, 'F'},
             {"debug",      1, 0, 'D'},
             {"start",      1, 0, 's'},
             {"size",       1, 0, 'e'},
@@ -437,7 +492,7 @@ int main(int argc, char **argv) {
     }
 
     while ((c = getopt_long(argc, argv,
-                            "cdfhklLe:E:s:S:tvVD:p:P:",
+                            "cdfhklLe:E:s:S:tvVF:D:p:P:",
                             longopts, NULL)) != EOF)
         switch (c) {
             case 'd': ++decompressFlag;                                      break;
@@ -449,6 +504,11 @@ int main(int argc, char **argv) {
             case 't': ++testFlag;                                            break;
             case 'v': ++verboseFlag;                                         break;
             case 'V': banner(); exit( 1 );                                   break;
+            case 'F':
+                if (!strcmp(optarg, "v1") || !strcmp(optarg, "1")) formatVersion = 1;
+                else if (!strcmp(optarg, "v2") || !strcmp(optarg, "2")) formatVersion = 2;
+                else err_fatal(__func__, "format must be v1 or v2\n");
+                break;
             case 's': ++decompressFlag; clStart = strtoul( optarg, NULL, 10 ); break;
             case 'e': ++decompressFlag; clSize  = strtoul( optarg, NULL, 10 ); break;
             default:
@@ -512,7 +572,7 @@ int main(int argc, char **argv) {
             }
         } else {
             snprintf(buffer, BUFFERSIZE - 1, "%s.dz", argv[i]);
-            if (!dict_data_zip(argv[i], buffer, pre, post)) {
+            if (!dict_data_zip(argv[i], buffer, pre, post, formatVersion)) {
                 if (!keepFlag && _unlink(argv[i]))
                     err_fatal_errno(__func__, "Cannot unlink %s\n", argv[i]);
             } else {

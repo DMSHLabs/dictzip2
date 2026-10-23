@@ -35,6 +35,7 @@ int mmap_mode = 0;
 static int dict_read_header(const char *filename, dictData *header, int computeCRC) {
     FILE          *str;
     int           id1, id2, si1, si2;
+    int           customV2 = 0;
     char          buffer[BUFFERSIZE];
     int           extraLength, subLength;
     int           i;
@@ -55,6 +56,53 @@ static int dict_read_header(const char *filename, dictData *header, int computeC
 
     id1 = getc(str);
     id2 = getc(str);
+
+    if (id1 == 'D' && id2 == 'Z') {
+        int m1 = getc(str), m2 = getc(str);
+        int v0 = getc(str), v1 = getc(str);
+        unsigned long long chunkCount = 0, sourceSize = 0;
+        unsigned long chunkSize = 0;
+        if (m1 != 'V' || m2 != '2' || v0 != 2 || v1 != 0) {
+            fclose(str); return 5;
+        }
+        for (i = 0; i < 4; ++i) {
+            int b = getc(str); if (b == EOF) { fclose(str); return 5; }
+            chunkSize |= ((unsigned long)b) << (8 * i);
+        }
+        for (i = 0; i < 8; ++i) {
+            int b = getc(str); if (b == EOF) { fclose(str); return 5; }
+            chunkCount |= ((unsigned long long)b) << (8 * i);
+        }
+        for (i = 0; i < 8; ++i) {
+            int b = getc(str); if (b == EOF) { fclose(str); return 5; }
+            sourceSize |= ((unsigned long long)b) << (8 * i);
+        }
+        if (!chunkSize || !chunkCount || chunkCount > 10000000ULL || chunkSize > 0x7fffffffUL) {
+            fclose(str); return 5;
+        }
+        header->chunkLength = (int)chunkSize;
+        header->chunkCount = (int)chunkCount;
+        header->length = sourceSize;
+        header->version = 2;
+        header->type = DICT_DZIP;
+        header->chunks = malloc(sizeof(header->chunks[0]) * header->chunkCount);
+        if (!header->chunks) { fclose(str); return 5; }
+        for (i = 0; i < header->chunkCount; ++i) {
+            unsigned long value = 0;
+            for (int b = 0; b < 4; ++b) {
+                int byte = getc(str); if (byte == EOF) { fclose(str); return 5; }
+                value |= ((unsigned long)byte) << (b * 8);
+            }
+            if (value > 0x7fffffffUL) { fclose(str); return 5; }
+            header->chunks[i] = (int)value;
+        }
+        header->headerLength = 26 + header->chunkCount * 4 + 10 - 1;
+        if (getc(str) != GZ_MAGIC1 || getc(str) != GZ_MAGIC2 ||
+            getc(str) != Z_DEFLATED || getc(str) != 0) { fclose(str); return 5; }
+        if (fseek(str, 6, SEEK_CUR)) { fclose(str); return 5; }
+        customV2 = 1;
+        goto header_parsed;
+    }
 
     if (id1 != GZ_MAGIC1 || id2 != GZ_MAGIC2) {
         header->type = DICT_TEXT;
@@ -92,31 +140,71 @@ static int dict_read_header(const char *filename, dictData *header, int computeC
         si1 = getc(str);
         si2 = getc(str);
 
-        if (si1 == GZ_RND_S1 && si2 == GZ_RND_S2) {
+        if (si1 == GZ_RND_S1 && (si2 == GZ_RND_S2 || si2 == 'Z')) {
             subLength = getc(str) << 0;
             subLength |= getc(str) << 8;
+            if (subLength < 6 || (unsigned long)subLength + 4 > (unsigned long)extraLength)
+                err_fatal(__func__, "invalid dictzip extra field\n");
             header->version = getc(str) << 0;
             header->version |= getc(str) << 8;
 
-            if (header->version != 1)
+            if (header->version != (si2 == 'Z' ? 2 : 1))
                 err_internal(__func__,
                              "dzip header version %d not supported\n",
                              header->version);
 
-            header->chunkLength = getc(str) << 0;
-            header->chunkLength |= getc(str) << 8;
-            header->chunkCount = getc(str) << 0;
-            header->chunkCount |= getc(str) << 8;
+            if (si2 == 'Z') {
+                header->chunkLength = getc(str) << 0;
+                header->chunkLength |= getc(str) << 8;
+                int countBytes[4];
+                for (int b = 0; b < 4; ++b) {
+                    countBytes[b] = getc(str);
+                    if (countBytes[b] == EOF) { fclose(str); return 5; }
+                }
+                header->chunkCount = countBytes[0] | (countBytes[1] << 8) |
+                                     (countBytes[2] << 16) | (countBytes[3] << 24);
+            } else {
+                header->chunkLength = getc(str) << 0;
+                header->chunkLength |= getc(str) << 8;
+                header->chunkCount = getc(str) << 0;
+                header->chunkCount |= getc(str) << 8;
+            }
 
-            if (header->chunkCount <= 0) {
+            if (header->chunkCount <= 0 ||
+                2 + (si2 == 'Z' ? 2 + 4 : 2 + 2) +
+                (unsigned long long)header->chunkCount * (si2 == 'Z' ? 4 : 2) +
+                (si2 == 'Z' ? 8 : 0) != (unsigned long long)subLength) {
                 fclose(str);
                 return 5;
             }
             header->chunks = malloc(sizeof(header->chunks[0])
                                     * header->chunkCount);
-            for (i = 0; i < header->chunkCount; i++) {
-                header->chunks[i] = getc(str) << 0;
-                header->chunks[i] |= getc(str) << 8;
+            if (si2 == 'Z') {
+                unsigned long long sourceSize = 0;
+                for (i = 0; i < header->chunkCount; ++i) {
+                    unsigned long value = 0;
+                    for (int b = 0; b < 4; ++b) {
+                        int byte = getc(str);
+                        if (byte == EOF) { fclose(str); return 5; }
+                        value |= ((unsigned long)byte) << (b * 8);
+                    }
+                    if (value > 0x7fffffffUL) { fclose(str); return 5; }
+                    header->chunks[i] = (int)value;
+                }
+                for (int b = 0; b < 8; ++b) {
+                    int byte = getc(str);
+                    if (byte == EOF) {
+                        fclose(str);
+                        return 5;
+                    }
+                    sourceSize |= ((unsigned long long)byte) << (b * 8);
+                }
+                header->length = sourceSize;
+            } else {
+                for (i = 0; i < header->chunkCount; i++) {
+                    header->chunks[i] = getc(str) << 0;
+                    header->chunks[i] |= getc(str) << 8;
+                }
             }
             header->type = DICT_DZIP;
         } else {
@@ -173,15 +261,18 @@ static int dict_read_header(const char *filename, dictData *header, int computeC
                      "File position (%lu) != header length + 1 (%d)\n",
                      ftell(str), header->headerLength + 1);
 
+header_parsed:
     fseek(str, -8, SEEK_END);
     header->crc = getc(str) << 0;
     header->crc |= getc(str) << 8;
     header->crc |= getc(str) << 16;
     header->crc |= getc(str) << 24;
-    header->length = getc(str) << 0;
-    header->length |= getc(str) << 8;
-    header->length |= getc(str) << 16;
-    header->length |= getc(str) << 24;
+    if (!customV2 && header->version != 2) {
+        header->length = getc(str) << 0;
+        header->length |= getc(str) << 8;
+        header->length |= getc(str) << 16;
+        header->length |= getc(str) << 24;
+    }
     header->compressedLength = ftell(str);
 
     /* Compute offsets */
@@ -296,7 +387,6 @@ char *dict_data_read_(
     unsigned long end;
     int           count;
     char          *inBuffer;
-    char          outBuffer[OUT_BUFFER_SIZE];
     int           firstChunk, lastChunk;
     int           firstOffset, lastOffset;
     int           i, j;
@@ -377,20 +467,15 @@ char *dict_data_read_(
                 } else {
                     h->cache[target].chunk = i;
                     if (!h->cache[target].inBuffer)
-                        h->cache[target].inBuffer = malloc(IN_BUFFER_SIZE);
+                        h->cache[target].inBuffer = malloc(
+                                h->chunkLength > IN_BUFFER_SIZE ? h->chunkLength : IN_BUFFER_SIZE);
                     inBuffer = h->cache[target].inBuffer;
 
-                    if (h->chunks[i] >= OUT_BUFFER_SIZE) {
-                        err_internal(__func__,
-                                     "h->chunks[%d] = %d >= %ld (OUT_BUFFER_SIZE)\n",
-                                     i, h->chunks[i], OUT_BUFFER_SIZE);
-                    }
-                    memcpy(outBuffer, h->start + h->offsets[i], h->chunks[i]);
-
-                    h->zStream.next_in   = (Bytef *) outBuffer;
+                    h->zStream.next_in   = (Bytef *)(h->start + h->offsets[i]);
                     h->zStream.avail_in  = h->chunks[i];
                     h->zStream.next_out  = (Bytef *) inBuffer;
-                    h->zStream.avail_out = IN_BUFFER_SIZE;
+                    h->zStream.avail_out = h->chunkLength > IN_BUFFER_SIZE
+                                            ? h->chunkLength : IN_BUFFER_SIZE;
                     if (inflate(&h->zStream, Z_PARTIAL_FLUSH) != Z_OK)
                         err_fatal(__func__, "inflate: %s\n", h->zStream.msg);
                     if (h->zStream.avail_in)
@@ -398,7 +483,8 @@ char *dict_data_read_(
                                      "inflate did not flush (%d pending, %d avail)\n",
                                      h->zStream.avail_in, h->zStream.avail_out);
 
-                    count = IN_BUFFER_SIZE - h->zStream.avail_out;
+                    count = (h->chunkLength > IN_BUFFER_SIZE
+                             ? h->chunkLength : IN_BUFFER_SIZE) - h->zStream.avail_out;
 
                     h->cache[target].count = count;
                 }
