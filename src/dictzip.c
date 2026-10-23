@@ -419,13 +419,22 @@ static void help(void) {
             "",
             "-d --decompress      decompress",
             "-f --force           force overwrite of output file",
-            "-h --help            give this help",
+            "-h, -?, --help       show this help",
             "-k --keep            do not delete original file",
             "-l --list            list compressed file contents",
             "-L --license         display software license",
             "-c --stdout          write to stdout (decompression only)",
             "-t --test            test compressed file integrity",
-            "--format v1|v2      select compression format (default: v1)",
+            "--format v1|v2       choose output format when compressing",
+            "                     v1: classic dictzip format (default)",
+            "                     v2: DZV2 container with a 64-bit source length",
+            "                         and full-size random-access index; block size",
+            "                         stays the same as v1. Older dictzip readers",
+            "                         do not support v2.",
+            "",
+            "Examples:",
+            "  dictzip --format v1 -k dictionary.dsl",
+            "  dictzip --format v2 -k dictionary.dsl",
 //      "-v --verbose         verbose mode",
             "-V --version         display version number",
             0};
@@ -492,7 +501,7 @@ int main(int argc, char **argv) {
     }
 
     while ((c = getopt_long(argc, argv,
-                            "cdfhklLe:E:s:S:tvVF:D:p:P:",
+                            "?cdfhklLe:E:s:S:tvVF:D:p:P:",
                             longopts, NULL)) != EOF)
         switch (c) {
             case 'd': ++decompressFlag;                                      break;
@@ -509,6 +518,7 @@ int main(int argc, char **argv) {
                 else if (!strcmp(optarg, "v2") || !strcmp(optarg, "2")) formatVersion = 2;
                 else err_fatal(__func__, "format must be v1 or v2\n");
                 break;
+            case '?': help(); exit(0);                                      break;
             case 's': ++decompressFlag; clStart = strtoul( optarg, NULL, 10 ); break;
             case 'e': ++decompressFlag; clSize  = strtoul( optarg, NULL, 10 ); break;
             default:
