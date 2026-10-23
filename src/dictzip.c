@@ -425,16 +425,15 @@ static void help(void) {
             "-L --license         display software license",
             "-c --stdout          write to stdout (decompression only)",
             "-t --test            test compressed file integrity",
-            "--format v1|v2       choose output format when compressing",
-            "                     v1: classic dictzip format (default)",
-            "                     v2: DZV2 container with a 64-bit source length",
+            "-v1                  use classic dictzip format (default)",
+            "-v2                  use DZV2 with a 64-bit source length",
             "                         and full-size random-access index; block size",
             "                         stays the same as v1. Older dictzip readers",
             "                         do not support v2.",
             "",
             "Examples:",
-            "  dictzip --format v1 -k dictionary.dsl",
-            "  dictzip --format v2 -k dictionary.dsl",
+            "  dictzip -k dictionary.dsl",
+            "  dictzip -v2 -k dictionary.dsl",
 //      "-v --verbose         verbose mode",
             "-V --version         display version number",
             0};
@@ -480,7 +479,6 @@ int main(int argc, char **argv) {
             {"test",       0, 0, 't'},
             {"verbose",    0, 0, 'v'},
             {"version",    0, 0, 'V'},
-            {"format",     1, 0, 'F'},
             {"debug",      1, 0, 'D'},
             {"start",      1, 0, 's'},
             {"size",       1, 0, 'e'},
@@ -500,8 +498,18 @@ int main(int argc, char **argv) {
         ++stdoutFlag;
     }
 
+    /* getopt has no multi-character short options; consume -v1/-v2 first. */
+    for (i = 1; i < (size_t)argc; ++i) {
+        if (!strcmp(argv[i], "-v1") || !strcmp(argv[i], "-v2")) {
+            formatVersion = argv[i][2] == '2' ? 2 : 1;
+            memmove(argv + i, argv + i + 1, (argc - i) * sizeof(argv[0]));
+            --argc;
+            --i;
+        }
+    }
+
     while ((c = getopt_long(argc, argv,
-                            "?cdfhklLe:E:s:S:tvVF:D:p:P:",
+                            "?cdfhklLe:E:s:S:tvVD:p:P:",
                             longopts, NULL)) != EOF)
         switch (c) {
             case 'd': ++decompressFlag;                                      break;
@@ -513,11 +521,6 @@ int main(int argc, char **argv) {
             case 't': ++testFlag;                                            break;
             case 'v': ++verboseFlag;                                         break;
             case 'V': banner(); exit( 1 );                                   break;
-            case 'F':
-                if (!strcmp(optarg, "v1") || !strcmp(optarg, "1")) formatVersion = 1;
-                else if (!strcmp(optarg, "v2") || !strcmp(optarg, "2")) formatVersion = 2;
-                else err_fatal(__func__, "format must be v1 or v2\n");
-                break;
             case '?': help(); exit(0);                                      break;
             case 's': ++decompressFlag; clStart = strtoul( optarg, NULL, 10 ); break;
             case 'e': ++decompressFlag; clSize  = strtoul( optarg, NULL, 10 ); break;
